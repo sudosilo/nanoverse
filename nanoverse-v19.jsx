@@ -6255,7 +6255,6 @@ export default function CityGrower() {
         </div>
       </div>
 
-      <div style={styles.hint}>drag to rotate · pinch to zoom</div>
 
       <button
         onClick={() => setPanel(p => !p)}
