@@ -4464,14 +4464,31 @@ export default function CityGrower() {
   // ============================================================
   // Ground / road cache
   // ============================================================
+  // Each cache keeps ONE canvas for its whole life. Allocating a fresh
+  // full screen canvas on every repaint piles up memory faster than
+  // mobile browsers free it, which crashes them.
+  function reuseCacheCanvas(ref, w, h, dpr) {
+    const W = Math.max(1, Math.round(w * dpr));
+    const H = Math.max(1, Math.round(h * dpr));
+    let off = ref.current && ref.current.canvas;
+    if (!off) off = document.createElement('canvas');
+    if (off.width !== W || off.height !== H) {
+      off.width = W;
+      off.height = H;
+    }
+    const ctx = off.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, W, H);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { off, ctx };
+  }
+
   function rebuildGroundCache(w, h, dpr) {
     const s = stateRef.current;
     if (!s) return;
-    const off = document.createElement('canvas');
-    off.width = w * dpr;
-    off.height = h * dpr;
-    const ctx = off.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { off, ctx } = reuseCacheCanvas(groundCacheRef, w, h, dpr);
 
     const light = lighting(sunAngleRef.current);
 
@@ -4611,11 +4628,7 @@ export default function CityGrower() {
   function rebuildRoadsCache(w, h, dpr) {
     const s = stateRef.current;
     if (!s) return;
-    const off = document.createElement('canvas');
-    off.width = w * dpr;
-    off.height = h * dpr;
-    const ctx = off.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { off, ctx } = reuseCacheCanvas(roadsCacheRef, w, h, dpr);
     const { project } = makeProjector(w, h);
 
     // painter-order revealed roads
@@ -4641,7 +4654,7 @@ export default function CityGrower() {
         lamps.push({ x, y });
       }
     }
-    s.lamps = lamps;
+    s.lamps = lamps.concat((s.lamps || []).filter(l => l.small));
     drawLampPostsInto(ctx, s, project);
 
     roadsCacheRef.current = { canvas: off, ctx, w, h, dpr };
@@ -4723,11 +4736,7 @@ export default function CityGrower() {
   function rebuildLandCache(w, h, dpr) {
     const s = stateRef.current;
     if (!s) return;
-    const off = document.createElement('canvas');
-    off.width = Math.round(w * dpr);
-    off.height = Math.round(h * dpr);
-    const ctx = off.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { off, ctx } = reuseCacheCanvas(landCacheRef, w, h, dpr);
     const { project } = makeProjector(w, h);
     const light = lighting(sunAngleRef.current);
     // FARMS: agricultural land covering undeveloped non-grass cells in shape.
@@ -4757,11 +4766,7 @@ export default function CityGrower() {
   function rebuildBuildingsCache(w, h, dpr) {
     const s = stateRef.current;
     if (!s) return;
-    const off = document.createElement('canvas');
-    off.width = w * dpr;
-    off.height = h * dpr;
-    const ctx = off.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { off, ctx } = reuseCacheCanvas(buildingsCacheRef, w, h, dpr);
 
     const { project } = makeProjector(w, h);
     const visibleFaces = visibleFacesForYaw(yaw);
