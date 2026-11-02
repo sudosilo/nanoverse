@@ -1,1 +1,2 @@
+2026-11-01, v2026.11.01. Published version 19 as nanoverse-v19.html with a vercel.json rewrite. Adds water with boats, docks and planned bridges, farmland that develops into neighborhoods and apartments, strip malls, parks, pedestrians, emergency vehicles, street lamps, an airport with planes, and fixed time of day.
 2026-10-08, v2026.10.08. First release. Published version 18 as a single standalone page.

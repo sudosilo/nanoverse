@@ -8,6 +8,6 @@ Live at nanoverse-psi.vercel.app
 
 This app is checked every morning by Control Troll.
 
-Latest change. First release. Published version 18 as a single standalone page.
+Latest change. Version 19 with water, bridges, farmland, airport and street life.
 
 See CHANGELOG.md for the full history.
