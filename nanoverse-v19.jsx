@@ -520,6 +520,8 @@ export default function CityGrower() {
   // Layer caches
   const groundCacheRef = useRef(null);     // {canvas, ctx, w, h, key}
   const roadsCacheRef = useRef(null);      // revealed road cells only
+  const landCacheRef = useRef(null);
+  const landFramesRef = useRef(0);
   const buildingsCacheRef = useRef(null);  // {canvas, ctx, w, h, dirtyCells: Set}
   const cacheKeyRef = useRef('');          // 'seed|yaw|zoom|w|h' -> invalidates everything
   const framesSinceRebuildRef = useRef(0);
@@ -4715,19 +4717,19 @@ export default function CityGrower() {
     return !!special && LIVE_ANIMATED_KINDS.has(special.kind);
   }
 
-  function rebuildBuildingsCache(w, h, dpr) {
+  // LAND CACHE: water, farms, dirt roads and grass. Expensive to paint,
+  // so it lives on its own layer under roads and buildings and is only
+  // repainted on a throttle when the land actually changed.
+  function rebuildLandCache(w, h, dpr) {
     const s = stateRef.current;
     if (!s) return;
     const off = document.createElement('canvas');
-    off.width = w * dpr;
-    off.height = h * dpr;
+    off.width = Math.round(w * dpr);
+    off.height = Math.round(h * dpr);
     const ctx = off.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     const { project } = makeProjector(w, h);
-    const visibleFaces = visibleFacesForYaw(yaw);
     const light = lighting(sunAngleRef.current);
-
     // FARMS: agricultural land covering undeveloped non-grass cells in shape.
     if (s.farmsDirty || s.farms.size === 0) {
       recomputeFarms(s);
@@ -4747,6 +4749,23 @@ export default function CityGrower() {
     // building neighbor (within 1 cell, 8-direction). This turns
     // "vacant lots inside developed blocks" green until built up.
     paintGrassInto(ctx, s, project, light);
+
+    landCacheRef.current = { canvas: off, w, h, dpr };
+    s.landDirty = false;
+  }
+
+  function rebuildBuildingsCache(w, h, dpr) {
+    const s = stateRef.current;
+    if (!s) return;
+    const off = document.createElement('canvas');
+    off.width = w * dpr;
+    off.height = h * dpr;
+    const ctx = off.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const { project } = makeProjector(w, h);
+    const visibleFaces = visibleFacesForYaw(yaw);
+    const light = lighting(sunAngleRef.current);
 
     // gather settled buildings, painter-sorted.
     // Skip cells that are part of a multi-cell special (non-owner).
@@ -5346,9 +5365,10 @@ export default function CityGrower() {
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
-    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
+    const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
       cacheKeyRef.current = ''; // force rebuild
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -5357,8 +5377,10 @@ export default function CityGrower() {
     const key = `${seed}|${yaw.toFixed(3)}|${zoom.toFixed(3)}|${w}|${h}|${paletteName}|${skin}`;
     if (key !== cacheKeyRef.current) {
       rebuildGroundCache(w, h, dpr);
+      rebuildLandCache(w, h, dpr);
       rebuildRoadsCache(w, h, dpr);
       rebuildBuildingsCache(w, h, dpr);
+      landFramesRef.current = 0;
       cacheKeyRef.current = key;
       framesSinceRebuildRef.current = 0;
     } else {
@@ -5376,10 +5398,13 @@ export default function CityGrower() {
       }
       // New road reveals expose fresh grass-eligible interior cells, so
       // rebuild buildings cache to repaint grass underneath.
-      if (hasRevealedRoads) {
-        rebuildBuildingsCache(w, h, dpr);
-        framesSinceRebuildRef.current = 0;
-      } else {
+      if (hasRevealedRoads || hasSettled) s.landDirty = true;
+      landFramesRef.current++;
+      if (s.landDirty && landFramesRef.current > 45) {
+        rebuildLandCache(w, h, dpr);
+        landFramesRef.current = 0;
+      }
+      {
         framesSinceRebuildRef.current++;
         if (framesSinceRebuildRef.current > 300) {
           rebuildBuildingsCache(w, h, dpr);
@@ -5392,7 +5417,9 @@ export default function CityGrower() {
     const gc = groundCacheRef.current;
     const rc = roadsCacheRef.current;
     const bc = buildingsCacheRef.current;
+    const lc = landCacheRef.current;
     if (gc) ctx.drawImage(gc.canvas, 0, 0, w, h);
+    if (lc) ctx.drawImage(lc.canvas, 0, 0, w, h);
     if (rc) ctx.drawImage(rc.canvas, 0, 0, w, h);
     if (bc) ctx.drawImage(bc.canvas, 0, 0, w, h);
 
