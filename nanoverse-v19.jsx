@@ -536,6 +536,10 @@ export default function CityGrower() {
   const [skin, setSkin] = useState('watercolor'); // watercolor | flat | outline | gradient | glass
   const [cycleSpeed, setCycleSpeed] = useState(0); // day/night auto-cycle removed; fixed time only
   const [carsEnabled, setCarsEnabled] = useState(true);
+  // Light effects (building shadows, lamp, headlight and pedestrian glows).
+  // Off by default because they are the heaviest thing the GPU draws.
+  const [effectsOn, setEffectsOn] = useState(false);
+  const effectsRef = useRef(false);
   const sunAngleRef = useRef(Math.PI * 0.25); // start mid-morning
   const lastSunRebuildRef = useRef(0);
 
@@ -572,6 +576,11 @@ export default function CityGrower() {
   useEffect(() => {
     cacheKeyRef.current = '';
   }, [skin]);
+
+  useEffect(() => {
+    effectsRef.current = effectsOn;
+    cacheKeyRef.current = '';
+  }, [effectsOn]);
 
   // Party mode forces midnight (for the disco effect) and invalidates cache
   useEffect(() => {
@@ -614,11 +623,36 @@ export default function CityGrower() {
     // forbids buildings on those cells, but the road tile itself only
     // becomes visible (cell = 3) when a building is placed adjacent to it.
 
+    // RAIL: one train line runs east to west along a mid-block row near the
+    // center. Its land cells are reserved (cells = 4) so nothing builds on
+    // them; road columns stay roads and become level crossings.
+    const railR = GRID * 0.42;
+    const railRowWater = (ry) => {
+      let w = 0, n = 0;
+      for (let x = 0; x < GRID; x++) {
+        if (shapeScore(shape, x, ry, GRID / 2, GRID / 2, railR) <= -0.18) continue;
+        n++;
+        if (water[ry * GRID + x] === 1) w++;
+      }
+      return n ? w / n : 1;
+    };
+    let railY = Math.floor(GRID / 2) + ROAD_SPACING;
+    while (railY % ROAD_SPACING !== 2) railY++;
+    if (railRowWater(railY) > 0.5) railY -= 2 * ROAD_SPACING;
+    let railX0 = GRID, railX1 = -1;
+    for (let x = 0; x < GRID; x++) {
+      if (shapeScore(shape, x, railY, GRID / 2, GRID / 2, railR) <= -0.18) continue;
+      railX0 = Math.min(railX0, x);
+      railX1 = Math.max(railX1, x);
+      const ri = railY * GRID + x;
+      if (!isRoad(x, railY) && water[ri] !== 1) cells[ri] = 4;
+    }
+
     // First site: snap to a non-road, non-water cell near center
     let sx = Math.floor(GRID / 2);
     let sy = Math.floor(GRID / 2);
     let guard = 0;
-    while ((isRoad(sx, sy) || water[sy * GRID + sx] !== 0) && guard < GRID) {
+    while ((isRoad(sx, sy) || water[sy * GRID + sx] !== 0 || sy === railY) && guard < GRID) {
       sx++;
       if (sx >= GRID) { sx = 0; sy++; }
       guard++;
@@ -646,6 +680,11 @@ export default function CityGrower() {
       boats: [],
       boatSpawnAccum: 0,
       docks: [],                // {x, y} dock platform anchor cells
+      railY, railX0, railX1,
+      train: null,
+      ship: null,
+      shipSpawnAccum: 0,
+      stadium: null,
       bridges: new Set(),       // idx of water cells that are bridge decks
       bridgeSpans: [],          // [{cells:[idx], a:{x,y}, b:{x,y}, horizontal, len}]
     };
@@ -903,7 +942,11 @@ export default function CityGrower() {
           const rb = region[bLand.y * GRID + bLand.x];
           const inShape = shapeScore(shape, aLand.x, aLand.y, s.cx, s.cy, s.r) > 0 &&
                           shapeScore(shape, bLand.x, bLand.y, s.cx, s.cy, s.r) > 0;
-          if (inShape && span >= 1 && span <= maxLen && ra !== rb && ra !== -1 && rb !== -1) {
+          const touchesRail = s.railY !== undefined &&
+            (aLand.y === s.railY || bLand.y === s.railY ||
+             (cells[0].x === cells[cells.length - 1].x &&
+              Math.min(aLand.y, bLand.y) < s.railY && Math.max(aLand.y, bLand.y) > s.railY));
+          if (!touchesRail && inShape && span >= 1 && span <= maxLen && ra !== rb && ra !== -1 && rb !== -1) {
             const waterCells = [];
             for (let w = j; w < k; w++) waterCells.push(cells[w].y * GRID + cells[w].x);
             crossings.push({
@@ -977,6 +1020,32 @@ export default function CityGrower() {
       }
       s.bridgeSpans.push(cross);
     }
+
+    // EXTRA BRIDGES: beyond the minimum network, add a few more crossings
+    // so a long river gets several bridges. Each must still be a legal,
+    // non-intersecting span and sit well apart from every other bridge.
+    const MAX_EXTRA = 5;
+    const MIN_SEP = 9;
+    const mid = (c) => ({ x: (c.a.x + c.b.x) / 2, y: (c.a.y + c.b.y) / 2 });
+    let extra = 0;
+    for (const cross of crossings) {
+      if (extra >= MAX_EXTRA) break;
+      if (s.bridgeSpans.includes(cross)) continue;
+      if (spanConflicts(cross)) continue;
+      const m = mid(cross);
+      let farEnough = true;
+      for (const b of s.bridgeSpans) {
+        const bm = mid(b);
+        if (Math.hypot(bm.x - m.x, bm.y - m.y) < MIN_SEP) { farEnough = false; break; }
+      }
+      if (!farEnough) continue;
+      for (const idx of cross.cells) {
+        s.bridges.add(idx);
+        committedCells.add(idx);
+      }
+      s.bridgeSpans.push(cross);
+      extra++;
+    }
   }
 
   // Docks: small piers on the water edge near where the city is likely to
@@ -990,6 +1059,7 @@ export default function CityGrower() {
         // land (or sand) cell that borders water, inside the shape
         const idx = y * GRID + x;
         if (s.water[idx] === 1) continue;
+        if (y === s.railY) continue;
         if (shapeScore(shape, x, y, s.cx, s.cy, s.r) <= 0) continue;
         // adjacent to water?
         let waterDir = null;
@@ -1206,6 +1276,9 @@ export default function CityGrower() {
     s.built++;
 
     // Once-only: build the airport at exactly 1005 buildings.
+    if (!s.stadium && s.built >= 300 && s.built % 15 === 0) {
+      tryPlaceStadium(s);
+    }
     if (s.built === 1005 && !s.airport) {
       tryPlaceAirport(s);
     }
@@ -1367,6 +1440,68 @@ export default function CityGrower() {
   // Once the city reaches 1005 buildings, search for a clear-ish strip
   // of land on the outskirts and plant an airport. The airport occupies
   // a 12x4 footprint with two parallel runways and a terminal building.
+  // ----- STADIUM --------------------------------------------------
+  // Once the city has some size, claim one whole empty city block (the
+  // 4x4 interior between roads) touching development and build a stadium.
+  function tryPlaceStadium(s) {
+    const cand = [];
+    for (let by = 0; by + ROAD_SPACING < GRID; by += ROAD_SPACING) {
+      for (let bx = 0; bx + ROAD_SPACING < GRID; bx += ROAD_SPACING) {
+        let ok = true;
+        for (let dy = 1; dy < ROAD_SPACING && ok; dy++) {
+          for (let dx = 1; dx < ROAD_SPACING && ok; dx++) {
+            const cx = bx + dx, cy = by + dy;
+            const i = cy * GRID + cx;
+            if (s.cells[i] !== 0) ok = false;
+            else if (s.water[i] === 1) ok = false;
+            else if (shapeScore(shape, cx, cy, s.cx, s.cy, s.r) <= 0) ok = false;
+          }
+        }
+        if (!ok) continue;
+        // must touch development on the surrounding road ring
+        let dev = false;
+        for (let k = 0; k <= ROAD_SPACING && !dev; k++) {
+          const ring = [[bx + k, by], [bx + k, by + ROAD_SPACING], [bx, by + k], [bx + ROAD_SPACING, by + k]];
+          for (const [rx, ry] of ring) {
+            if (rx < 0 || ry < 0 || rx >= GRID || ry >= GRID) continue;
+            const v = s.cells[ry * GRID + rx];
+            if (v === 2 || v === 3) { dev = true; break; }
+          }
+        }
+        if (dev) cand.push({ bx, by });
+      }
+    }
+    if (!cand.length) return;
+    const pick = cand[Math.floor(s.rand() * cand.length)];
+    const ox = pick.bx + 1, oy = pick.by + 1;
+    const ownerIdx = oy * GRID + ox;
+    const size = ROAD_SPACING - 1;
+    for (let dy = 0; dy < size; dy++) {
+      for (let dx = 0; dx < size; dx++) {
+        const i = (oy + dy) * GRID + (ox + dx);
+        s.cells[i] = 2;
+        s.specialOwner[i] = ownerIdx;
+        s.currentH[i] = 0.6;
+        s.targetH[i] = 0.6;
+        s.farms.delete(i);
+        s.newlySettled.push(i);
+      }
+    }
+    s.specialOwner[ownerIdx] = -1;
+    s.specials.set(ownerIdx, {
+      kind: 'stadium', size, palIdx: 0, variance: s.rand(), accentPalIdx: 0,
+    });
+    s.stadium = { x: ox, y: oy, size };
+    s.farmsDirty = true;
+    s.landDirty = true;
+    for (let k = 0; k <= ROAD_SPACING; k++) {
+      revealRoadAt(s, pick.bx + k, pick.by);
+      revealRoadAt(s, pick.bx + k, pick.by + ROAD_SPACING);
+      revealRoadAt(s, pick.bx, pick.by + k);
+      revealRoadAt(s, pick.bx + ROAD_SPACING, pick.by + k);
+    }
+  }
+
   function tryPlaceAirport(s) {
     const W = 12, H = 4;
     // Score every candidate top-left position by:
@@ -1392,6 +1527,7 @@ export default function CityGrower() {
           }
         }
         if (inShape < W * H * 0.7) continue;
+        if (s.railY >= y && s.railY < y + H) continue;
         const dxC = (x + W / 2) - s.cx;
         const dyC = (y + H / 2) - s.cy;
         const dist = Math.sqrt(dxC * dxC + dyC * dyC) / Math.max(1, s.r);
@@ -1869,6 +2005,79 @@ export default function CityGrower() {
     }
   }
 
+  // ----- TRAIN ----------------------------------------------------
+  // A push pull train shuttles along the rail line, reversing at each end.
+  const TRAIN_UNITS = 5;
+  const TRAIN_UNIT_LEN = 0.9;
+  const TRAIN_GAP = 0.12;
+  function stepTrain(dt) {
+    const s = stateRef.current;
+    if (!s || s.railY === undefined || s.railX1 - s.railX0 < 8) return;
+    const len = TRAIN_UNITS * TRAIN_UNIT_LEN + (TRAIN_UNITS - 1) * TRAIN_GAP;
+    const lo = s.railX0 + 0.2, hi = s.railX1 + 0.8 - len;
+    if (!s.train) s.train = { x: lo, dir: 1, wait: 0 };
+    const t = s.train;
+    if (t.wait > 0) { t.wait -= dt; return; }
+    t.x += t.dir * 2.4 * dt;
+    if (t.x >= hi) { t.x = hi; t.dir = -1; t.wait = 2.5; }
+    if (t.x <= lo) { t.x = lo; t.dir = 1; t.wait = 2.5; }
+  }
+
+  // ----- BIG SHIP ---------------------------------------------------
+  // One large ship cruises open water. It needs water ahead of its bow and
+  // on both sides, so it stays in the wide parts of the lake or river.
+  function shipFits(s, x, y, dx, dy) {
+    const px = -dy, py = dx;
+    for (const ahead of [0.9, 1.4]) {
+      for (const side of [-0.5, 0, 0.5]) {
+        const cx = Math.floor(x + dx * ahead + px * side);
+        const cy = Math.floor(y + dy * ahead + py * side);
+        if (cx < 0 || cy < 0 || cx >= GRID || cy >= GRID) return false;
+        const i = cy * GRID + cx;
+        if (s.water[i] !== 1 || s.bridges.has(i) || cy === s.railY) return false;
+      }
+    }
+    return true;
+  }
+  function stepShip(dt) {
+    const s = stateRef.current;
+    if (!s || !s.water) return;
+    if (!s.ship) {
+      s.shipSpawnAccum += dt;
+      if (s.shipSpawnAccum < 3) return;
+      s.shipSpawnAccum = 0;
+      for (let tries = 0; tries < 200; tries++) {
+        const i = Math.floor(s.rand() * GRID * GRID);
+        if (s.water[i] !== 1) continue;
+        const x = i % GRID + 0.5, y = Math.floor(i / GRID) + 0.5;
+        const dirs = [[1,0],[-1,0],[0,1],[0,-1]].filter(([dx, dy]) => shipFits(s, x, y, dx, dy));
+        if (!dirs.length) continue;
+        const [dx, dy] = dirs[Math.floor(s.rand() * dirs.length)];
+        s.ship = { x, y, dx, dy };
+        return;
+      }
+      return;
+    }
+    const sh = s.ship;
+    if (shipFits(s, sh.x, sh.y, sh.dx, sh.dy)) {
+      sh.x += sh.dx * 0.35 * dt;
+      sh.y += sh.dy * 0.35 * dt;
+      return;
+    }
+    // turn at the shore: snap to the cell center and pick a clear heading
+    const cx = Math.floor(sh.x) + 0.5, cy = Math.floor(sh.y) + 0.5;
+    const turns = [[1,0],[-1,0],[0,1],[0,-1]].filter(([dx, dy]) =>
+      !(dx === -sh.dx && dy === -sh.dy) && shipFits(s, cx, cy, dx, dy));
+    if (turns.length) {
+      const [dx, dy] = turns[Math.floor(s.rand() * turns.length)];
+      sh.x = cx; sh.y = cy; sh.dx = dx; sh.dy = dy;
+    } else if (shipFits(s, cx, cy, -sh.dx, -sh.dy)) {
+      sh.x = cx; sh.y = cy; sh.dx = -sh.dx; sh.dy = -sh.dy;
+    } else {
+      s.ship = null;
+    }
+  }
+
   function stepBoats(dt) {
     const s = stateRef.current;
     if (!s || !s.water) return;
@@ -2233,7 +2442,7 @@ export default function CityGrower() {
     const light = lighting(sunAngleRef.current);
 
     // Shadow
-    if (light.daylight > 0.05) {
+    if (effectsRef.current && light.daylight > 0.05) {
       const dx = light.shadowDX * visualH * 0.18;
       const dy = light.shadowDY * visualH * 0.18;
       const shadowPts = fCorners.map(c => project(x + c.dx + dx, y + c.dy + dy, baseZ));
@@ -2294,6 +2503,12 @@ export default function CityGrower() {
     // AIRPORT: flat rectangular tarmac with runways, terminal, hangar.
     if (special.kind === 'airport') {
       drawAirport(ctx, project, x, y, special, baseZ, light, animating);
+      return;
+    }
+
+    // STADIUM: oval bowl with tiered stands, a striped pitch and floodlights.
+    if (special.kind === 'stadium') {
+      drawStadium(ctx, project, x, y, special, baseZ, light);
       return;
     }
 
@@ -2665,6 +2880,149 @@ export default function CityGrower() {
 
   // AIRPORT: flat tarmac slab with two parallel runways, taxiways,
   // a terminal building on one side, and threshold/centerline lights.
+  // Axis aligned box in grid space. Side faces are painted back to front
+  // by screen depth, then the top, so it reads right from any rotation.
+  function drawGridBox(ctx, project, x0, y0, x1, y1, z0, z1, topCol, sideCol, edgeCol) {
+    const c = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+    const faces = [];
+    for (let i = 0; i < 4; i++) {
+      const a = c[i], b = c[(i + 1) % 4];
+      const pa0 = project(a[0], a[1], z0), pb0 = project(b[0], b[1], z0);
+      const pa1 = project(a[0], a[1], z1), pb1 = project(b[0], b[1], z1);
+      faces.push({ pts: [pa0, pb0, pb1, pa1], depth: (pa0.y + pb0.y) / 2 });
+    }
+    faces.sort((f, g) => f.depth - g.depth);
+    for (const f of faces) {
+      ctx.beginPath();
+      ctx.moveTo(f.pts[0].x, f.pts[0].y);
+      for (let i = 1; i < 4; i++) ctx.lineTo(f.pts[i].x, f.pts[i].y);
+      ctx.closePath();
+      ctx.fillStyle = sideCol;
+      ctx.fill();
+      if (edgeCol) { ctx.strokeStyle = edgeCol; ctx.lineWidth = 0.4; ctx.stroke(); }
+    }
+    const t = c.map(([px, py]) => project(px, py, z1));
+    ctx.beginPath();
+    ctx.moveTo(t[0].x, t[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(t[i].x, t[i].y);
+    ctx.closePath();
+    ctx.fillStyle = topCol;
+    ctx.fill();
+    if (edgeCol) { ctx.strokeStyle = edgeCol; ctx.lineWidth = 0.4; ctx.stroke(); }
+  }
+
+  function drawStadium(ctx, project, x, y, special, baseZ, light) {
+    const size = special.size;
+    const cx = x + size / 2, cy = y + size / 2;
+    const isNight = light.daylight < 0.4;
+    const N = 44;
+    const ring = (r, z) => {
+      const pts = [];
+      for (let i = 0; i < N; i++) {
+        const a = (i / N) * Math.PI * 2;
+        pts.push(project(cx + Math.cos(a) * r * 1.12, cy + Math.sin(a) * r * 0.9, z));
+      }
+      return pts;
+    };
+    const fillPoly = (pts, col) => {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
+      ctx.fillStyle = col;
+      ctx.fill();
+    };
+    const R = size * 0.46;
+    const wallH = 0.95;
+    // concourse plaza under the whole block
+    const plaza = [[x, y], [x + size, y], [x + size, y + size], [x, y + size]].map(([px, py]) => project(px, py, baseZ + 0.01));
+    fillPoly(plaza, tintHex('#cfc6b4', light));
+    // outer wall band (front facing quads only)
+    const bot = ring(R, baseZ), top = ring(R, baseZ + wallH);
+    const centerY = project(cx, cy, baseZ).y;
+    for (let i = 0; i < N; i++) {
+      const j = (i + 1) % N;
+      if ((bot[i].y + bot[j].y) / 2 < centerY) continue;
+      ctx.beginPath();
+      ctx.moveTo(bot[i].x, bot[i].y);
+      ctx.lineTo(bot[j].x, bot[j].y);
+      ctx.lineTo(top[j].x, top[j].y);
+      ctx.lineTo(top[i].x, top[i].y);
+      ctx.closePath();
+      ctx.fillStyle = tintHex(i % 2 ? '#8b8f9c' : '#7f8492', light);
+      ctx.fill();
+    }
+    // window band on the wall
+    ctx.strokeStyle = isNight ? 'rgba(255,220,140,0.95)' : tintHex('#5a6070', light);
+    ctx.lineWidth = Math.max(1, zoom * 0.8);
+    ctx.beginPath();
+    let started = false;
+    const mid = ring(R, baseZ + wallH * 0.55);
+    for (let i = 0; i <= N; i++) {
+      const k = i % N;
+      if (mid[k].y < centerY) { started = false; continue; }
+      if (!started) { ctx.moveTo(mid[k].x, mid[k].y); started = true; }
+      else ctx.lineTo(mid[k].x, mid[k].y);
+    }
+    ctx.stroke();
+    // tiered stands, outer to inner, seats in blue
+    const tiers = [
+      { r: R, z: wallH, col: '#2f5f9e' },
+      { r: R * 0.86, z: wallH * 0.78, col: '#3b72b8' },
+      { r: R * 0.73, z: wallH * 0.56, col: '#2f5f9e' },
+      { r: R * 0.62, z: wallH * 0.36, col: '#3b72b8' },
+    ];
+    for (const t of tiers) fillPoly(ring(t.r, baseZ + t.z), tintHex(t.col, light));
+    // pitch
+    const pitchZ = baseZ + wallH * 0.22;
+    fillPoly(ring(R * 0.52, pitchZ), tintHex('#5f9a45', light));
+    // mowing stripes and markings, clipped to the pitch oval
+    ctx.save();
+    const pitch = ring(R * 0.52, pitchZ);
+    ctx.beginPath();
+    ctx.moveTo(pitch[0].x, pitch[0].y);
+    for (let i = 1; i < pitch.length; i++) ctx.lineTo(pitch[i].x, pitch[i].y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.strokeStyle = tintHex('#6fae52', light);
+    ctx.lineWidth = Math.max(1.5, zoom * 1.6);
+    for (let k = -4; k <= 4; k += 2) {
+      const a = project(cx + k * 0.12, cy - R, pitchZ), b = project(cx + k * 0.12, cy + R, pitchZ);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(250,250,245,0.85)';
+    ctx.lineWidth = 0.7;
+    const m0 = project(cx, cy - R, pitchZ), m1 = project(cx, cy + R, pitchZ);
+    ctx.beginPath(); ctx.moveTo(m0.x, m0.y); ctx.lineTo(m1.x, m1.y); ctx.stroke();
+    const cc = ring(R * 0.14, pitchZ);
+    ctx.beginPath();
+    ctx.moveTo(cc[0].x, cc[0].y);
+    for (let i = 1; i < cc.length; i++) ctx.lineTo(cc[i].x, cc[i].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+    // floodlight towers at the four corners
+    const poleH = 2.4;
+    for (const [px, py] of [[x + 0.25, y + 0.25], [x + size - 0.25, y + 0.25], [x + size - 0.25, y + size - 0.25], [x + 0.25, y + size - 0.25]]) {
+      const b = project(px, py, baseZ), t = project(px, py, baseZ + poleH);
+      ctx.strokeStyle = tintHex('#4a4d57', light);
+      ctx.lineWidth = Math.max(1, zoom * 0.7);
+      ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+      ctx.fillStyle = isNight ? '#fff6d8' : tintHex('#d9d6cc', light);
+      ctx.fillRect(t.x - 3 * zoom, t.y - 2 * zoom, 6 * zoom, 3 * zoom);
+      if (isNight) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        const g = ctx.createRadialGradient(t.x, t.y, 0, t.x, t.y, 26 * zoom);
+        g.addColorStop(0, 'rgba(255,250,225,0.55)');
+        g.addColorStop(1, 'rgba(255,250,225,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(t.x, t.y, 26 * zoom, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
   function drawAirport(ctx, project, ax, ay, special, baseZ, light, animating) {
     const W = special.width, H = special.height;
     // Tarmac base
@@ -4255,7 +4613,7 @@ export default function CityGrower() {
     // Shadow direction from current sun position. Skipped at night.
     const light = lighting(sunAngleRef.current);
     const z = bh + baseZ;
-    if (light.daylight > 0.05) {
+    if (effectsRef.current && light.daylight > 0.05) {
       const dx = light.shadowDX * z * 0.18, dy = light.shadowDY * z * 0.18;
       const shadowPts = corners.map(c => project(x + c.dx + dx, y + c.dy + dy, baseZ));
       ctx.beginPath();
@@ -4737,6 +5095,15 @@ export default function CityGrower() {
     const s = stateRef.current;
     if (!s) return;
     const { off, ctx } = reuseCacheCanvas(landCacheRef, w, h, dpr);
+    // Ground (paper and sky) is baked into the land layer so the frame
+    // only blits one background image instead of two.
+    const gcl = groundCacheRef.current;
+    if (gcl) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(gcl.canvas, 0, 0);
+      ctx.restore();
+    }
     const { project } = makeProjector(w, h);
     const light = lighting(sunAngleRef.current);
     // FARMS: agricultural land covering undeveloped non-grass cells in shape.
@@ -4758,6 +5125,9 @@ export default function CityGrower() {
     // building neighbor (within 1 cell, 8-direction). This turns
     // "vacant lots inside developed blocks" green until built up.
     paintGrassInto(ctx, s, project, light);
+
+    // RAIL: the train line, on top of the land layer.
+    paintRailInto(ctx, s, project, light);
 
     landCacheRef.current = { canvas: off, w, h, dpr };
     s.landDirty = false;
@@ -5248,6 +5618,69 @@ export default function CityGrower() {
     }
   }
 
+  // Train line along s.railY: ballast and ties on land, a timber trestle
+  // over water. Revealed road cells at crossings are painted later by the
+  // road layer, which reads as a level crossing.
+  function paintRailInto(ctx, s, project, light) {
+    if (s.railY === undefined || s.railX1 < s.railX0) return;
+    const y = s.railY;
+    const grassCol = tintHex('#7d9c5c', light);
+    const ballast = tintHex('#8a8278', light);
+    const tieCol = tintHex('#5a4632', light);
+    const railCol = tintHex('#3a4a66', light);
+    for (let x = s.railX0; x <= s.railX1; x++) {
+      const idx = y * GRID + x;
+      const overWater = s.water && s.water[idx] === 1;
+      const zAt = (fx, fy) => overWater ? 0.24 : pointElev(s, fx, fy) + 0.01;
+      if (overWater) {
+        // trestle piles
+        if (x % 2 === 0) {
+          for (const py of [y + 0.3, y + 0.7]) {
+            const b = project(x + 0.5, py, 0), t = project(x + 0.5, py, 0.24);
+            ctx.strokeStyle = tintHex('#4e3a28', light);
+            ctx.lineWidth = Math.max(1, zoom * 0.6);
+            ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+          }
+        }
+        const d = [[x, y + 0.25], [x + 1, y + 0.25], [x + 1, y + 0.75], [x, y + 0.75]].map(([px, py]) => project(px, py, 0.24));
+        ctx.beginPath(); ctx.moveTo(d[0].x, d[0].y);
+        for (let i = 1; i < 4; i++) ctx.lineTo(d[i].x, d[i].y);
+        ctx.closePath();
+        ctx.fillStyle = tintHex('#6e5640', light);
+        ctx.fill();
+      } else if (!(isRoad(x, y) && s.cells[idx] === 3)) {
+        const full = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]].map(([px, py]) => project(px, py, cornerElev(s, px, py) + 0.006));
+        ctx.beginPath(); ctx.moveTo(full[0].x, full[0].y);
+        for (let i = 1; i < 4; i++) ctx.lineTo(full[i].x, full[i].y);
+        ctx.closePath();
+        ctx.fillStyle = grassCol;
+        ctx.fill();
+        const bed = [[x, y + 0.27], [x + 1, y + 0.27], [x + 1, y + 0.73], [x, y + 0.73]].map(([px, py]) => project(px, py, zAt(px, py)));
+        ctx.beginPath(); ctx.moveTo(bed[0].x, bed[0].y);
+        for (let i = 1; i < 4; i++) ctx.lineTo(bed[i].x, bed[i].y);
+        ctx.closePath();
+        ctx.fillStyle = ballast;
+        ctx.fill();
+      }
+      // ties
+      ctx.strokeStyle = tieCol;
+      ctx.lineWidth = Math.max(0.8, zoom * 0.6);
+      for (let k = 0; k < 4; k++) {
+        const tx = x + 0.125 + k * 0.25;
+        const a = project(tx, y + 0.32, zAt(tx, y + 0.32) + 0.01);
+        const b = project(tx, y + 0.68, zAt(tx, y + 0.68) + 0.01);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+      // rails
+      ctx.strokeStyle = railCol;
+      ctx.lineWidth = Math.max(0.7, zoom * 0.5);
+      for (const ry of [y + 0.4, y + 0.6]) {
+        const a = project(x, ry, zAt(x, ry) + 0.03), b = project(x + 1, ry, zAt(x + 1, ry) + 0.03);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+    }
+  }
+
   // Paints grass for every empty interior cell adjacent to developed
   // (road or built) cells. Used inside the buildings cache rebuild.
   function paintGrassInto(ctx, s, project, light) {
@@ -5367,7 +5800,9 @@ export default function CityGrower() {
     const s = stateRef.current;
     if (!s) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    // Cap the pixel ratio: phones report up to 3x, which makes every
+    // layer blit and fill push several times more pixels for little gain.
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
@@ -5423,8 +5858,8 @@ export default function CityGrower() {
     const rc = roadsCacheRef.current;
     const bc = buildingsCacheRef.current;
     const lc = landCacheRef.current;
-    if (gc) ctx.drawImage(gc.canvas, 0, 0, w, h);
     if (lc) ctx.drawImage(lc.canvas, 0, 0, w, h);
+    else if (gc) ctx.drawImage(gc.canvas, 0, 0, w, h);
     if (rc) ctx.drawImage(rc.canvas, 0, 0, w, h);
     if (bc) ctx.drawImage(bc.canvas, 0, 0, w, h);
 
@@ -5460,7 +5895,7 @@ export default function CityGrower() {
     // Park lamps (l.small) get smaller, slightly cooler glows.
     if (s.lamps && s.lamps.length) {
       const lampLight = lighting(sunAngleRef.current);
-      if (lampLight.daylight < 0.5) {
+      if (effectsRef.current && lampLight.daylight < 0.5) {
         const a = (0.5 - lampLight.daylight) / 0.5; // 0..1 ramp into night
         ctx.save();
         ctx.globalCompositeOperation = 'lighter';
@@ -5534,7 +5969,7 @@ export default function CityGrower() {
         const carZ = pointElev(s, c.x, c.y);
         const p = project(c.x, c.y, carZ);
         // headlight glow at night — projected slightly forward
-        if (carLight.daylight < 0.4) {
+        if (effectsRef.current && carLight.daylight < 0.4) {
           const pHead = project(c.x + c.dx * 0.45, c.y + c.dy * 0.45, carZ);
           const glowG = ctx.createRadialGradient(pHead.x, pHead.y, 0, pHead.x, pHead.y, 9);
           glowG.addColorStop(0, `rgba(255,235,160,${0.55 * (1 - carLight.daylight)})`);
@@ -5645,7 +6080,7 @@ export default function CityGrower() {
         const neck = project(p.x, p.y, pedZ + totalH * 0.85);
         const head = project(p.x, p.y, pedZ + totalH);
         // soft warm halo at night so peds read against dark roads
-        if (isNight) {
+        if (effectsRef.current && isNight) {
           const halo = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, 6);
           halo.addColorStop(0, `rgba(255,220,150,${0.35 * (1 - pedLight.daylight)})`);
           halo.addColorStop(1, 'rgba(255,220,150,0)');
@@ -5767,6 +6202,74 @@ export default function CityGrower() {
           }
           ctx.restore();
         }
+      }
+    }
+
+    // BIG SHIP
+    if (s.ship) {
+      const sh = s.ship;
+      const lt = lighting(sunAngleRef.current);
+      const night = lt.daylight < 0.4;
+      const along = sh.dx !== 0;
+      const box = (a0, a1, w, z0, z1, top, side) => {
+        // a0..a1 along the heading, w half width, relative to ship center
+        const d = along ? sh.dx : sh.dy;
+        const lo = Math.min(a0 * d, a1 * d), hi = Math.max(a0 * d, a1 * d);
+        if (along) drawGridBox(ctx, project, sh.x + lo, sh.y - w, sh.x + hi, sh.y + w, z0, z1, top, side, 'rgba(20,25,40,0.35)');
+        else drawGridBox(ctx, project, sh.x - w, sh.y + lo, sh.x + w, sh.y + hi, z0, z1, top, side, 'rgba(20,25,40,0.35)');
+      };
+      // wake
+      const tail = project(sh.x - sh.dx * 1.0, sh.y - sh.dy * 1.0, 0.01);
+      const wakeEnd = project(sh.x - sh.dx * 2.2, sh.y - sh.dy * 2.2, 0.01);
+      ctx.strokeStyle = 'rgba(225,238,248,0.35)';
+      ctx.lineWidth = Math.max(2, zoom * 2.5);
+      ctx.beginPath(); ctx.moveTo(tail.x, tail.y); ctx.lineTo(wakeEnd.x, wakeEnd.y); ctx.stroke();
+      // hull, deckhouse, bridge, funnel
+      box(-1.0, 1.0, 0.32, 0.0, 0.22, tintHex('#c9c2b2', lt), tintHex('#1f3d6b', lt));
+      box(-0.75, 0.05, 0.24, 0.22, 0.5, tintHex('#f2efe8', lt), tintHex('#dcd8cf', lt));
+      box(-0.7, -0.35, 0.2, 0.5, 0.68, tintHex('#f2efe8', lt), tintHex('#d2cec4', lt));
+      box(-0.25, -0.05, 0.09, 0.5, 0.92, tintHex('#2f6fd0', lt), tintHex('#c8452f', lt));
+      if (night) {
+        const w0 = project(sh.x - sh.dx * 0.7, sh.y - sh.dy * 0.7, 0.38);
+        const w1 = project(sh.x + sh.dx * 0.0, sh.y + sh.dy * 0.0, 0.38);
+        ctx.strokeStyle = 'rgba(255,220,140,0.95)';
+        ctx.lineWidth = Math.max(1, zoom * 0.8);
+        ctx.beginPath(); ctx.moveTo(w0.x, w0.y); ctx.lineTo(w1.x, w1.y); ctx.stroke();
+      }
+    }
+
+    // TRAIN
+    if (s.train) {
+      const tr = s.train;
+      const lt = lighting(sunAngleRef.current);
+      const night = lt.daylight < 0.4;
+      const y = s.railY;
+      for (let u = 0; u < TRAIN_UNITS; u++) {
+        const x0 = tr.x + u * (TRAIN_UNIT_LEN + TRAIN_GAP);
+        const x1 = x0 + TRAIN_UNIT_LEN;
+        const mx = (x0 + x1) / 2;
+        const ci = y * GRID + Math.max(0, Math.min(GRID - 1, Math.floor(mx)));
+        const z0 = (s.water && s.water[ci] === 1) ? 0.27 : pointElev(s, mx, y + 0.5) + 0.04;
+        const loco = u === 0 || u === TRAIN_UNITS - 1;
+        drawGridBox(ctx, project, x0, y + 0.3, x1, y + 0.7, z0, z0 + 0.34,
+          tintHex(loco ? '#2b5fae' : '#d8d4cc', lt),
+          tintHex(loco ? '#1f4785' : '#9a3b32', lt),
+          'rgba(20,20,30,0.45)');
+        // window strip
+        const wa = project(x0 + 0.1, y + 0.7, z0 + 0.22), wb = project(x1 - 0.1, y + 0.7, z0 + 0.22);
+        ctx.strokeStyle = night ? 'rgba(255,220,140,0.95)' : 'rgba(40,50,70,0.7)';
+        ctx.lineWidth = Math.max(1, zoom * 0.7);
+        ctx.beginPath(); ctx.moveTo(wa.x, wa.y); ctx.lineTo(wb.x, wb.y); ctx.stroke();
+      }
+      if (night && effectsRef.current) {
+        const len = TRAIN_UNITS * TRAIN_UNIT_LEN + (TRAIN_UNITS - 1) * TRAIN_GAP;
+        const hx = tr.dir > 0 ? tr.x + len + 0.3 : tr.x - 0.3;
+        const hp = project(hx, y + 0.5, pointElev(s, Math.max(0, Math.min(GRID - 1, hx)), y + 0.5) + 0.2);
+        const g = ctx.createRadialGradient(hp.x, hp.y, 0, hp.x, hp.y, 14);
+        g.addColorStop(0, 'rgba(255,240,190,0.7)');
+        g.addColorStop(1, 'rgba(255,240,190,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(hp.x, hp.y, 14, 0, Math.PI * 2); ctx.fill();
       }
     }
 
@@ -6005,6 +6508,8 @@ export default function CityGrower() {
         stepPeds(dt);
         stepPlanes(dt);
         stepBoats(dt);
+        stepTrain(dt);
+        stepShip(dt);
       }
       // Cars + peds should keep moving in party mode even if "running" is off
       if (partyMode && !running && carsEnabled) stepCars(dt);
@@ -6363,6 +6868,14 @@ export default function CityGrower() {
               style={{ ...styles.shapeBtn, ...(carsEnabled ? styles.shapeBtnActive : null), flex: 1 }}
               onClick={() => setCarsEnabled(c => !c)}
             >{carsEnabled ? 'on' : 'off'}</button>
+          </div>
+
+          <div style={{ ...styles.sectionLabel, marginTop: 12 }}>LIGHT EFFECTS</div>
+          <div style={styles.btnRow}>
+            <button
+              style={{ ...styles.shapeBtn, ...(effectsOn ? styles.shapeBtnActive : null), flex: 1 }}
+              onClick={() => setEffectsOn(v => !v)}
+            >{effectsOn ? 'on' : 'off'}</button>
           </div>
 
           <div style={{ ...styles.sectionLabel, marginTop: 12 }}>BLOCK PARTY</div>
